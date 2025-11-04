@@ -1,0 +1,16 @@
+[project]
+name = "coach-ai"
+version = "0.1.0"
+description = "ADHD coaching assistant as an MCP server"
+requires-python = ">=3.10"
+dependencies = [
+    "mcp>=1.0.0",
+    "aiosqlite>=0.20.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project.scripts]
+coach-ai = "coach_ai.server:main"

@@ -1,0 +1,15 @@
+{
+  "mcpServers": {
+    "coach-ai": {
+      "command": "uv",
+      "args": [
+        "run",
+        "--directory",
+        "/absolute/path/to/coach-ai",
+        "python",
+        "-m",
+        "coach_ai.server"
+      ]
+    }
+  }
+}
