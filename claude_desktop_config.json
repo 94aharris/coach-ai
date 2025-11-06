@@ -9,7 +9,11 @@
         "python",
         "-m",
         "coach_ai.server"
-      ]
+      ],
+      "env": {
+        "OBSIDIAN_VAULT_PATH": "/Users/your-username/Documents/ObsidianVault",
+        "DAILY_NOTES_FORMAT": "Daily Notes/{date}.md"
+      }
     }
   }
 }
