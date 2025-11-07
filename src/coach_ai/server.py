@@ -144,6 +144,27 @@ async def get_recommendation() -> str:
 
 
 @mcp.tool()
+async def start_my_day(date_str: str = None) -> str:
+    """Start your day with a comprehensive overview and briefing.
+
+    This is your main morning routine tool. It will:
+    - Review all active todos from the database
+    - Read yesterday's daily note to see what you accomplished
+    - Create today's daily note if it doesn't exist
+    - Provide all context for a personalized daily briefing
+
+    Perfect for: "What should I focus on today?" or "Start my day"
+
+    Args:
+        date_str: Optional date in YYYY-MM-DD format (defaults to today)
+
+    Returns:
+        Comprehensive context for generating a personalized daily briefing
+    """
+    return await daily_notes.start_my_day(date_str)
+
+
+@mcp.tool()
 async def create_daily_note(date_str: str = None) -> str:
     """Create today's (or specified) daily note with smart population.
 

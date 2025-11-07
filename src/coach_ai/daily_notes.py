@@ -36,6 +36,170 @@ def get_vault() -> Optional[ObsidianVault]:
 # ============================================================================
 
 
+async def start_my_day(date_str: str = None) -> str:
+    """Start your day with a comprehensive overview.
+
+    This tool:
+    - Reviews all active todos from the database
+    - Reads yesterday's daily note (if it exists)
+    - Reads or creates today's daily note
+    - Returns all data for the LLM to provide a personalized summary
+
+    Args:
+        date_str: Optional date in YYYY-MM-DD format (defaults to today)
+
+    Returns:
+        Comprehensive context for the LLM to generate a daily briefing
+    """
+    vault = get_vault()
+    if not vault:
+        return "❌ Obsidian vault not configured. Set OBSIDIAN_VAULT_PATH environment variable."
+
+    # Parse date
+    if date_str:
+        try:
+            date = datetime.strptime(date_str, "%Y-%m-%d")
+        except ValueError:
+            return f"❌ Invalid date format. Use YYYY-MM-DD, got: {date_str}"
+    else:
+        date = datetime.now()
+
+    db = await get_db()
+
+    # Build comprehensive context
+    context = "=== START MY DAY BRIEFING ===\n\n"
+    context += f"Date: {date.strftime('%A, %B %d, %Y')}\n\n"
+
+    # 1. Get all active todos from database
+    todos_cursor = await db.execute(
+        """
+        SELECT id, title, priority, notes, created_at
+        FROM todos
+        WHERE status = 'active'
+        ORDER BY
+            CASE priority
+                WHEN 'high' THEN 1
+                WHEN 'medium' THEN 2
+                WHEN 'low' THEN 3
+            END,
+            created_at ASC
+        """
+    )
+    todos = await todos_cursor.fetchall()
+
+    if todos:
+        context += "📋 ACTIVE TODOS:\n"
+        for todo in todos:
+            context += f"  [{todo['id']}] {todo['title']} (priority: {todo['priority']})\n"
+            if todo['notes']:
+                context += f"      Notes: {todo['notes']}\n"
+        context += "\n"
+    else:
+        context += "📋 ACTIVE TODOS: None\n\n"
+
+    # 2. Get active goals
+    goals_cursor = await db.execute(
+        "SELECT goal, timeframe, category FROM goals WHERE status = 'active' ORDER BY created_at DESC"
+    )
+    goals = await goals_cursor.fetchall()
+
+    if goals:
+        context += "🎯 ACTIVE GOALS:\n"
+        for goal in goals:
+            context += f"  - {goal['goal']} ({goal['timeframe']}, {goal['category']})\n"
+        context += "\n"
+
+    # 3. Get user facts/patterns
+    facts_cursor = await db.execute(
+        "SELECT fact, category FROM user_facts ORDER BY created_at DESC LIMIT 10"
+    )
+    facts = await facts_cursor.fetchall()
+
+    if facts:
+        context += "🧠 WHAT I KNOW ABOUT YOU:\n"
+        for fact in facts:
+            context += f"  - {fact['fact']} ({fact['category']})\n"
+        context += "\n"
+
+    # 4. Read yesterday's note
+    from datetime import timedelta
+    yesterday = date - timedelta(days=1)
+
+    if vault.daily_note_exists(yesterday):
+        yesterday_note = vault.read_daily_note(yesterday)
+        if yesterday_note:
+            context += f"📖 YESTERDAY'S NOTE ({yesterday.strftime('%Y-%m-%d')}):\n\n"
+
+            # Show tasks from yesterday
+            if yesterday_note['tasks']:
+                completed = [t for t in yesterday_note['tasks'] if t['completed']]
+                incomplete = [t for t in yesterday_note['tasks'] if not t['completed']]
+
+                if completed:
+                    context += f"  ✅ Completed ({len(completed)} tasks):\n"
+                    for task in completed[:5]:
+                        context += f"    - {task['text']}\n"
+                    if len(completed) > 5:
+                        context += f"    ... and {len(completed) - 5} more\n"
+                    context += "\n"
+
+                if incomplete:
+                    context += f"  ⏸️ Incomplete ({len(incomplete)} tasks):\n"
+                    for task in incomplete[:5]:
+                        context += f"    - {task['text']}\n"
+                    if len(incomplete) > 5:
+                        context += f"    ... and {len(incomplete) - 5} more\n"
+                    context += "\n"
+
+            # Show accomplishments
+            if yesterday_note['accomplishments']:
+                context += "  💪 Accomplishments:\n"
+                for acc in yesterday_note['accomplishments'][:5]:
+                    context += f"    - {acc}\n"
+                context += "\n"
+    else:
+        context += f"📖 YESTERDAY'S NOTE: No note found for {yesterday.strftime('%Y-%m-%d')}\n\n"
+
+    # 5. Check if today's note exists, create if not
+    today_note_existed = vault.daily_note_exists(date)
+
+    if not today_note_existed:
+        context += "📝 TODAY'S NOTE: Creating new daily note...\n\n"
+        # Create the note (reuse existing logic)
+        await create_daily_note(date_str)
+    else:
+        context += "📝 TODAY'S NOTE: Already exists\n\n"
+
+    # 6. Read today's note
+    today_note = vault.read_daily_note(date)
+    if today_note:
+        if today_note['tasks']:
+            context += f"  📋 Tasks planned for today ({len(today_note['tasks'])} total):\n"
+            for task in today_note['tasks'][:10]:
+                status = "✅" if task['completed'] else "⬜"
+                context += f"    {status} {task['text']}\n"
+            if len(today_note['tasks']) > 10:
+                context += f"    ... and {len(today_note['tasks']) - 10} more\n"
+
+        context += f"\n  Path: {today_note['path']}\n"
+
+    context += "\n"
+    context += "=== BRIEFING REQUEST ===\n\n"
+    context += (
+        "Based on the above information, provide a personalized daily briefing that:\n"
+        "1. Welcomes the user and acknowledges yesterday's progress (if any)\n"
+        "2. Highlights incomplete tasks from yesterday that might need attention\n"
+        "3. Suggests what to focus on first today based on priorities and goals\n"
+        "4. Provides motivation and considers ADHD-friendly approaches:\n"
+        "   - Start with a quick win to build momentum\n"
+        "   - Break down overwhelming tasks\n"
+        "   - Acknowledge energy levels and patterns\n"
+        "5. Keep it concise, actionable, and encouraging\n"
+    )
+
+    return context
+
+
 async def create_daily_note(date_str: str = None) -> str:
     """Create today's (or specified) daily note with smart population.
 
