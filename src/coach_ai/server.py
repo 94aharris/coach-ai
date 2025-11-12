@@ -14,15 +14,16 @@ mcp = FastMCP("Coach AI")
 
 
 @mcp.tool()
-async def add_todo(title: str, priority: str = "medium", notes: str = "") -> str:
-    """Add a new todo item.
+async def add_todo(title: str, priority: str = "medium", notes: str = "", quick: bool = False) -> str:
+    """Add a new todo item with smart categorization.
 
     Args:
         title: The todo title/description
         priority: Priority level - 'low', 'medium', or 'high' (default: 'medium')
         notes: Optional additional notes or context
+        quick: Mark as quick win for low-energy moments (auto-sets low priority)
     """
-    return await storage.add_todo(title, priority, notes)
+    return await storage.add_todo(title, priority, notes, quick)
 
 
 @mcp.tool()
@@ -145,23 +146,49 @@ async def get_recommendation() -> str:
 
 @mcp.tool()
 async def start_my_day(date_str: str = None) -> str:
-    """Start your day with a comprehensive overview and briefing.
+    """Start your day with smart task selection and daily note creation.
 
-    This is your main morning routine tool. It will:
-    - Review all active todos from the database
-    - Read yesterday's daily note to see what you accomplished
-    - Create today's daily note if it doesn't exist
-    - Provide all context for a personalized daily briefing
+    ENHANCED - Obsidian-first workflow:
+    - Syncs yesterday's completed tasks from daily note
+    - Intelligently selects 3-5 tasks from backlog using deterministic algorithm
+    - Creates today's daily note with selected tasks organized by priority
+    - Returns comprehensive briefing for the day
 
-    Perfect for: "What should I focus on today?" or "Start my day"
+    Selection algorithm picks:
+    - 1 critical task (deadlines or highest priority)
+    - 1-2 important tasks (high-impact work)
+    - 2-3 quick wins (low-effort, high-dopamine)
+
+    Perfect for: "Start my day" or "What should I focus on today?"
 
     Args:
         date_str: Optional date in YYYY-MM-DD format (defaults to today)
 
     Returns:
-        Comprehensive context for generating a personalized daily briefing
+        Daily briefing with selected tasks, goals, and motivational message
     """
     return await daily_notes.start_my_day(date_str)
+
+
+@mcp.tool()
+async def sync_daily_note(date_str: str = None) -> str:
+    """Sync completed tasks from Obsidian daily note to database.
+
+    NEW TOOL - Bidirectional sync:
+    Reads markdown checkboxes (- [x]) from your daily note and automatically
+    marks matching todos as complete in the database. Uses fuzzy matching to
+    handle partial text matches.
+
+    This enables an Obsidian-first workflow: work in your daily note, check
+    off tasks there, then sync back to Coach AI's database.
+
+    Args:
+        date_str: Optional date in YYYY-MM-DD format (defaults to today)
+
+    Returns:
+        Summary of tasks synced and any warnings about unmatched checkboxes
+    """
+    return await daily_notes.sync_daily_note(date_str)
 
 
 @mcp.tool()

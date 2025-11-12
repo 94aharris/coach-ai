@@ -92,7 +92,11 @@ Set in Claude Desktop config under `env` section:
 ## MCP Tool Categories
 
 ### Todo Management
-- `add_todo()` - Create todos with priority (low/medium/high)
+- `add_todo()` - ENHANCED: Create todos with priority, auto-categorization, time extraction, quick win detection
+  - New `quick` parameter for low-energy tasks
+  - Auto-tags: [Sprint Work], [Management], [Deadline], [Quick Win]
+  - Extracts time estimates from notes ("30min", "2h")
+  - Returns task ID and guidance
 - `list_todos()` - Filter by active/completed/all
 - `complete_todo()` - Mark complete with timestamp
 - `delete_todo()` - Permanent deletion
@@ -111,9 +115,18 @@ Set in Claude Desktop config under `env` section:
 - Returns context for AI to generate personalized suggestions
 
 ### Obsidian Integration
-- `start_my_day()` - Morning routine: review yesterday, create today, provide briefing
+- `start_my_day()` - ENHANCED PHASE 1: Smart task selection and daily note creation
+  - Syncs yesterday's completed tasks from Obsidian checkboxes
+  - Intelligently selects 3-5 tasks from backlog (critical, important, quick wins)
+  - Creates daily note with selected tasks organized by priority
+  - Deterministic algorithm (no LLM required)
+- `sync_daily_note()` - NEW PHASE 1: Bidirectional sync from Obsidian
+  - Reads markdown checkboxes (- [x]) from daily note
+  - Fuzzy matches checkbox text to todos in database
+  - Marks matching todos as complete with timestamp
+  - Enables Obsidian-first workflow
 - `create_daily_note()` - Smart population with carryover and goal-based tasks
-- `sync_from_daily_note()` - Read and parse daily note
+- `sync_from_daily_note()` - Read and parse daily note (legacy)
 - `read_daily_note_full()` - Complete note with all sections
 - `read_daily_note_section()` - Read specific section by name
 - `write_daily_note_section()` - Write/append to section
@@ -125,9 +138,23 @@ Set in Claude Desktop config under `env` section:
 
 ### Database Schema
 
-Todos have `status` field: "active" or "completed"
-Goals have `status` field: "active" (no completion tracking yet)
-User facts have `category`: "preferences", "challenges", "strengths", "patterns", "routines", "general"
+**Todos table** (Phase 1 enhanced):
+- `status` field: "active" or "completed"
+- `priority`: "low", "medium", "high"
+- `skipped_count` (NEW): Tracks tasks moved forward repeatedly (backlog hell detection)
+- `time_estimate` (NEW): Estimated minutes to complete
+- `last_scheduled` (NEW): Last date task was scheduled in daily note
+
+**Goals table**:
+- `status` field: "active" (no completion tracking yet)
+
+**User facts table**:
+- `category`: "preferences", "challenges", "strengths", "patterns", "routines", "general"
+
+**Schema versioning** (Phase 1):
+- Migrations tracked in `schema_version` table
+- Safe column additions via `migrations.py`
+- Current version: 1
 
 ### Task Priority in Daily Notes
 
@@ -160,12 +187,25 @@ All Obsidian file operations use:
 2. Rename to actual file (atomic on POSIX)
 This prevents corruption if interrupted
 
-### ADHD-Friendly Features
+### ADHD-Friendly Features (Phase 1 Enhanced)
 
+- **Smart task selection**: Deterministic algorithm picks 3-5 tasks from backlog
+  - 1 critical task (deadlines or highest priority)
+  - 1-2 important tasks (high-impact work)
+  - 2-3 quick wins (low-effort, dopamine generators)
 - **Quick wins**: Low activation energy tasks for momentum
+  - Auto-detected from time estimates (<30min)
+  - Can be explicitly flagged with `quick=True`
+  - Shown with time estimates in daily note
+- **Auto-categorization**: Keywords trigger automatic tagging
+  - Sprint/Management/Deadline detection
+  - Time estimate extraction from notes
+- **Backlog hell prevention**: Tracks `skipped_count` for tasks moved forward 5+ times
+- **Obsidian-first workflow**: Work in daily note, sync back to database
+- **Friction-free capture**: Add todos with minimal decisions (defaults to medium priority)
 - **Late start detection**: `datetime.now().hour > 10` triggers gentler quick wins
 - **Monday awareness**: Extra-small tasks on Mondays
-- **Carryover limiting**: Max 3-5 tasks from yesterday to avoid overwhelm
+- **Carryover limiting**: Max 3-5 tasks selected to avoid overwhelm
 - **Positive reinforcement**: Accomplishment logging and celebration
 
 ## Testing Notes

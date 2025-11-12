@@ -1,11 +1,15 @@
 """Daily note creation and management for Coach AI."""
 
 import os
-from datetime import datetime
+from datetime import datetime, date, timedelta
 from typing import Optional
+from difflib import SequenceMatcher
+
+import aiosqlite
 
 from coach_ai.obsidian import ObsidianVault
 from coach_ai.storage import get_db
+from coach_ai.task_selection import select_tasks_for_today, increment_skip_counts
 
 
 # Global Obsidian vault connection
@@ -37,19 +41,19 @@ def get_vault() -> Optional[ObsidianVault]:
 
 
 async def start_my_day(date_str: str = None) -> str:
-    """Start your day with a comprehensive overview.
+    """Start your day with smart task selection and daily note creation.
 
-    This tool:
-    - Reviews all active todos from the database
-    - Reads yesterday's daily note (if it exists)
-    - Reads or creates today's daily note
-    - Returns all data for the LLM to provide a personalized summary
+    ENHANCED VERSION - Obsidian-first workflow:
+    - Syncs yesterday's completed tasks from daily note
+    - Intelligently selects 3-5 tasks from backlog
+    - Creates or updates today's daily note with selected tasks
+    - Returns comprehensive briefing for the day
 
     Args:
         date_str: Optional date in YYYY-MM-DD format (defaults to today)
 
     Returns:
-        Comprehensive context for the LLM to generate a daily briefing
+        Daily briefing with selected tasks and context
     """
     vault = get_vault()
     if not vault:
@@ -58,146 +62,98 @@ async def start_my_day(date_str: str = None) -> str:
     # Parse date
     if date_str:
         try:
-            date = datetime.strptime(date_str, "%Y-%m-%d")
+            target_date = datetime.strptime(date_str, "%Y-%m-%d").date()
         except ValueError:
             return f"❌ Invalid date format. Use YYYY-MM-DD, got: {date_str}"
     else:
-        date = datetime.now()
+        target_date = date.today()
 
     db = await get_db()
 
-    # Build comprehensive context
-    context = "=== START MY DAY BRIEFING ===\n\n"
-    context += f"Date: {date.strftime('%A, %B %d, %Y')}\n\n"
+    # Build briefing
+    briefing = "=== 🌅 START MY DAY ===\n\n"
+    briefing += f"📅 {target_date.strftime('%A, %B %d, %Y')}\n\n"
 
-    # 1. Get all active todos from database
-    todos_cursor = await db.execute(
-        """
-        SELECT id, title, priority, notes, created_at
-        FROM todos
-        WHERE status = 'active'
-        ORDER BY
-            CASE priority
-                WHEN 'high' THEN 1
-                WHEN 'medium' THEN 2
-                WHEN 'low' THEN 3
-            END,
-            created_at ASC
-        """
+    # 1. Sync yesterday's note first (mark completed tasks)
+    yesterday = target_date - timedelta(days=1)
+    if vault.daily_note_exists(datetime.combine(yesterday, datetime.min.time())):
+        sync_result = await _sync_completed_tasks(vault, yesterday, db)
+        if sync_result["completed_count"] > 0:
+            briefing += f"✅ Synced {sync_result['completed_count']} completed tasks from yesterday\n"
+            for task in sync_result["completed_tasks"][:3]:
+                briefing += f"   - {task}\n"
+            if sync_result["completed_count"] > 3:
+                briefing += f"   ... and {sync_result['completed_count'] - 3} more\n"
+            briefing += "\n"
+
+    # 2. Select tasks for today using smart algorithm
+    selected = await select_tasks_for_today(db, target_date, max_tasks=5)
+
+    total_selected = (
+        len(selected["critical"]) + len(selected["important"]) + len(selected["quick_wins"])
     )
-    todos = await todos_cursor.fetchall()
 
-    if todos:
-        context += "📋 ACTIVE TODOS:\n"
-        for todo in todos:
-            context += f"  [{todo['id']}] {todo['title']} (priority: {todo['priority']})\n"
-            if todo['notes']:
-                context += f"      Notes: {todo['notes']}\n"
-        context += "\n"
+    briefing += f"📋 Selected {total_selected} tasks from {selected['backlog_count']} in backlog\n\n"
+
+    # 3. Create or update today's daily note
+    note_existed = vault.daily_note_exists(datetime.combine(target_date, datetime.min.time()))
+
+    if not note_existed:
+        # Create new note with selected tasks
+        await _create_daily_note_with_tasks(vault, target_date, selected)
+        briefing += f"📝 Created today's daily note\n\n"
     else:
-        context += "📋 ACTIVE TODOS: None\n\n"
+        # Note exists - could update it or leave as-is
+        briefing += f"📝 Daily note already exists\n\n"
 
-    # 2. Get active goals
+    # 4. Show selected tasks in briefing
+    if selected["critical"]:
+        briefing += "🎯 **CRITICAL (Do This First)**\n"
+        for task in selected["critical"]:
+            briefing += f"   [{task['id']}] {task['title']}\n"
+            if task.get("notes"):
+                briefing += f"       Note: {task['notes'][:100]}\n"
+        briefing += "\n"
+
+    if selected["important"]:
+        briefing += "🔥 **IMPORTANT (Pick 1-2)**\n"
+        for task in selected["important"]:
+            briefing += f"   [{task['id']}] {task['title']}\n"
+        briefing += "\n"
+
+    if selected["quick_wins"]:
+        briefing += "⚡ **QUICK WINS (Energy Permitting)**\n"
+        for task in selected["quick_wins"]:
+            time_str = f" ({task['time_estimate']}min)" if task.get("time_estimate") else ""
+            briefing += f"   [{task['id']}] {task['title']}{time_str}\n"
+        briefing += "\n"
+
+    # 5. Get active goals for context
     goals_cursor = await db.execute(
-        "SELECT goal, timeframe, category FROM goals WHERE status = 'active' ORDER BY created_at DESC"
+        "SELECT goal, timeframe FROM goals WHERE status = 'active' LIMIT 3"
     )
     goals = await goals_cursor.fetchall()
 
     if goals:
-        context += "🎯 ACTIVE GOALS:\n"
+        briefing += "🎯 **Active Goals**\n"
         for goal in goals:
-            context += f"  - {goal['goal']} ({goal['timeframe']}, {goal['category']})\n"
-        context += "\n"
+            briefing += f"   - {goal['goal']} ({goal['timeframe']})\n"
+        briefing += "\n"
 
-    # 3. Get user facts/patterns
-    facts_cursor = await db.execute(
-        "SELECT fact, category FROM user_facts ORDER BY created_at DESC LIMIT 10"
-    )
-    facts = await facts_cursor.fetchall()
+    # 6. Add note path
+    note_path = vault.get_daily_note_path(datetime.combine(target_date, datetime.min.time()))
+    briefing += f"📄 Daily note: {note_path}\n\n"
 
-    if facts:
-        context += "🧠 WHAT I KNOW ABOUT YOU:\n"
-        for fact in facts:
-            context += f"  - {fact['fact']} ({fact['category']})\n"
-        context += "\n"
-
-    # 4. Read yesterday's note
-    from datetime import timedelta
-    yesterday = date - timedelta(days=1)
-
-    if vault.daily_note_exists(yesterday):
-        yesterday_note = vault.read_daily_note(yesterday)
-        if yesterday_note:
-            context += f"📖 YESTERDAY'S NOTE ({yesterday.strftime('%Y-%m-%d')}):\n\n"
-
-            # Show tasks from yesterday
-            if yesterday_note['tasks']:
-                completed = [t for t in yesterday_note['tasks'] if t['completed']]
-                incomplete = [t for t in yesterday_note['tasks'] if not t['completed']]
-
-                if completed:
-                    context += f"  ✅ Completed ({len(completed)} tasks):\n"
-                    for task in completed[:5]:
-                        context += f"    - {task['text']}\n"
-                    if len(completed) > 5:
-                        context += f"    ... and {len(completed) - 5} more\n"
-                    context += "\n"
-
-                if incomplete:
-                    context += f"  ⏸️ Incomplete ({len(incomplete)} tasks):\n"
-                    for task in incomplete[:5]:
-                        context += f"    - {task['text']}\n"
-                    if len(incomplete) > 5:
-                        context += f"    ... and {len(incomplete) - 5} more\n"
-                    context += "\n"
-
-            # Show accomplishments
-            if yesterday_note['accomplishments']:
-                context += "  💪 Accomplishments:\n"
-                for acc in yesterday_note['accomplishments'][:5]:
-                    context += f"    - {acc}\n"
-                context += "\n"
+    # 7. Motivational message
+    current_hour = datetime.now().hour
+    if current_hour < 12:
+        briefing += "💪 Good morning! Start with the critical task or a quick win to build momentum.\n"
+    elif current_hour < 17:
+        briefing += "💪 Afternoon check-in! Pick one task from the important section.\n"
     else:
-        context += f"📖 YESTERDAY'S NOTE: No note found for {yesterday.strftime('%Y-%m-%d')}\n\n"
+        briefing += "💪 Evening session! Focus on quick wins if energy is low.\n"
 
-    # 5. Check if today's note exists, create if not
-    today_note_existed = vault.daily_note_exists(date)
-
-    if not today_note_existed:
-        context += "📝 TODAY'S NOTE: Creating new daily note...\n\n"
-        # Create the note (reuse existing logic)
-        await create_daily_note(date_str)
-    else:
-        context += "📝 TODAY'S NOTE: Already exists\n\n"
-
-    # 6. Read today's note
-    today_note = vault.read_daily_note(date)
-    if today_note:
-        if today_note['tasks']:
-            context += f"  📋 Tasks planned for today ({len(today_note['tasks'])} total):\n"
-            for task in today_note['tasks'][:10]:
-                status = "✅" if task['completed'] else "⬜"
-                context += f"    {status} {task['text']}\n"
-            if len(today_note['tasks']) > 10:
-                context += f"    ... and {len(today_note['tasks']) - 10} more\n"
-
-        context += f"\n  Path: {today_note['path']}\n"
-
-    context += "\n"
-    context += "=== BRIEFING REQUEST ===\n\n"
-    context += (
-        "Based on the above information, provide a personalized daily briefing that:\n"
-        "1. Welcomes the user and acknowledges yesterday's progress (if any)\n"
-        "2. Highlights incomplete tasks from yesterday that might need attention\n"
-        "3. Suggests what to focus on first today based on priorities and goals\n"
-        "4. Provides motivation and considers ADHD-friendly approaches:\n"
-        "   - Start with a quick win to build momentum\n"
-        "   - Break down overwhelming tasks\n"
-        "   - Acknowledge energy levels and patterns\n"
-        "5. Keep it concise, actionable, and encouraging\n"
-    )
-
-    return context
+    return briefing
 
 
 async def create_daily_note(date_str: str = None) -> str:
@@ -599,6 +555,225 @@ async def add_daily_note_section(
         return f"❌ Failed to add section '{section_name}'. Daily note may not exist."
 
     return f"✅ Added new section '{section_name}' to daily note for {date.strftime('%Y-%m-%d')}."
+
+
+async def sync_daily_note(date_str: str = None) -> str:
+    """Sync completed tasks from Obsidian daily note to database.
+
+    NEW TOOL - Bidirectional sync:
+    Reads markdown checkboxes from daily note and marks matching
+    todos as complete in the database.
+
+    Args:
+        date_str: Optional date in YYYY-MM-DD format (defaults to today)
+
+    Returns:
+        Summary of synced tasks
+    """
+    vault = get_vault()
+    if not vault:
+        return "❌ Obsidian vault not configured."
+
+    if date_str:
+        try:
+            target_date = datetime.strptime(date_str, "%Y-%m-%d").date()
+        except ValueError:
+            return f"❌ Invalid date format: {date_str}"
+    else:
+        target_date = date.today()
+
+    db = await get_db()
+
+    sync_result = await _sync_completed_tasks(vault, target_date, db)
+
+    result = f"📝 Synced daily note for {target_date.strftime('%Y-%m-%d')}\n\n"
+
+    if sync_result["completed_count"] > 0:
+        result += f"✅ Marked {sync_result['completed_count']} tasks complete:\n"
+        for task in sync_result["completed_tasks"]:
+            result += f"   - {task}\n"
+    else:
+        result += "No new completed tasks found.\n"
+
+    if sync_result["warnings"]:
+        result += f"\n⚠️  {len(sync_result['warnings'])} checkboxes couldn't be matched to todos\n"
+
+    return result
+
+
+async def _sync_completed_tasks(
+    vault: ObsidianVault, target_date: date, db: aiosqlite.Connection
+) -> dict:
+    """Internal helper to sync completed tasks from daily note.
+
+    Returns:
+        Dict with completed_count, completed_tasks list, and warnings
+    """
+    note_data = vault.read_daily_note(datetime.combine(target_date, datetime.min.time()))
+
+    if not note_data:
+        return {"completed_count": 0, "completed_tasks": [], "warnings": []}
+
+    completed_checkboxes = [
+        task for task in note_data.get("tasks", []) if task.get("completed")
+    ]
+
+    if not completed_checkboxes:
+        return {"completed_count": 0, "completed_tasks": [], "warnings": []}
+
+    # Get all active todos from database
+    cursor = await db.execute(
+        "SELECT id, title FROM todos WHERE status = 'active'"
+    )
+    active_todos = {row["id"]: row["title"] for row in await cursor.fetchall()}
+
+    completed_tasks = []
+    warnings = []
+
+    for checkbox in completed_checkboxes:
+        checkbox_text = checkbox["text"]
+
+        # Try to match checkbox to a todo
+        matched_id = _fuzzy_match_task(checkbox_text, active_todos)
+
+        if matched_id:
+            # Mark as complete
+            await db.execute(
+                "UPDATE todos SET status = 'completed', completed_at = ? WHERE id = ?",
+                (datetime.now().isoformat(), matched_id),
+            )
+            completed_tasks.append(active_todos[matched_id])
+        else:
+            warnings.append(checkbox_text)
+
+    await db.commit()
+
+    return {
+        "completed_count": len(completed_tasks),
+        "completed_tasks": completed_tasks,
+        "warnings": warnings,
+    }
+
+
+def _fuzzy_match_task(checkbox_text: str, todos: dict) -> Optional[int]:
+    """Match checkbox text to a todo using fuzzy matching.
+
+    Args:
+        checkbox_text: Text from checkbox (e.g., "IMAGE_TAG env var")
+        todos: Dict of {id: title} for all active todos
+
+    Returns:
+        ID of matched todo, or None if no good match
+    """
+    best_match_id = None
+    best_ratio = 0.0
+
+    checkbox_lower = checkbox_text.lower().strip()
+
+    for todo_id, todo_title in todos.items():
+        title_lower = todo_title.lower().strip()
+
+        # Exact match
+        if checkbox_lower == title_lower:
+            return todo_id
+
+        # Substring match
+        if checkbox_lower in title_lower or title_lower in checkbox_lower:
+            return todo_id
+
+        # Fuzzy match
+        ratio = SequenceMatcher(None, checkbox_lower, title_lower).ratio()
+        if ratio > best_ratio:
+            best_ratio = ratio
+            best_match_id = todo_id
+
+    # Return best match if similarity > 70%
+    if best_ratio > 0.7:
+        return best_match_id
+
+    return None
+
+
+async def _create_daily_note_with_tasks(
+    vault: ObsidianVault, target_date: date, selected: dict
+) -> str:
+    """Create daily note with smart task selection.
+
+    Args:
+        vault: Obsidian vault instance
+        target_date: Date for the note
+        selected: Dict from select_tasks_for_today with critical/important/quick_wins
+
+    Returns:
+        Path to created note
+    """
+    # Build sections
+    critical_section = ""
+    if selected["critical"]:
+        critical_section = "## 🎯 Today's Focus (Pick 1)\n\n"
+        for task in selected["critical"]:
+            critical_section += f"- [ ] {task['title']}\n"
+            if task.get("notes"):
+                # Add notes as indented comment
+                for line in task["notes"].split("\n"):
+                    if line.strip():
+                        critical_section += f"  > {line}\n"
+
+    important_section = ""
+    if selected["important"]:
+        important_section = "## 🔥 Important (Pick 1-2)\n\n"
+        for task in selected["important"]:
+            important_section += f"- [ ] {task['title']}\n"
+
+    quick_wins_section = ""
+    if selected["quick_wins"]:
+        quick_wins_section = "## ⚡ Quick Wins (Energy Permitting)\n\n"
+        for task in selected["quick_wins"]:
+            time_str = f" `{task['time_estimate']}min`" if task.get("time_estimate") else ""
+            quick_wins_section += f"- [ ] {task['title']}{time_str}\n"
+
+    # Build full content
+    day_name = target_date.strftime("%A")
+    full_date = target_date.strftime("%B %d, %Y")
+
+    content = f"# {day_name}, {full_date}\n\n"
+
+    if critical_section:
+        content += critical_section + "\n"
+    if important_section:
+        content += important_section + "\n"
+    if quick_wins_section:
+        content += quick_wins_section + "\n"
+
+    # Add backlog count
+    total_selected = (
+        len(selected["critical"]) + len(selected["important"]) + len(selected["quick_wins"])
+    )
+    remaining = selected["backlog_count"] - total_selected
+    content += f"## 📋 Backlog\n\n"
+    content += f"<!-- {remaining} tasks remaining - run sync_daily_note to update -->\n\n"
+
+    # Add sections
+    content += "## 📝 Notes\n\n\n"
+    content += "## ✅ Completed Today\n\n<!-- Completed tasks will appear here -->\n"
+
+    # Create note with frontmatter
+    metadata = {
+        "date": target_date.isoformat(),
+        "type": "daily-note",
+        "day_of_week": day_name.lower(),
+    }
+
+    import frontmatter
+    post = frontmatter.Post(content, **metadata)
+
+    note_path = vault.get_daily_note_path(datetime.combine(target_date, datetime.min.time()))
+    note_path.parent.mkdir(parents=True, exist_ok=True)
+
+    with open(note_path, "w", encoding="utf-8") as f:
+        f.write(frontmatter.dumps(post))
+
+    return str(note_path)
 
 
 async def generate_daily_summary(date_str: str = None) -> str:

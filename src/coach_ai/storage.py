@@ -1,10 +1,14 @@
 """Database storage layer for Coach AI."""
 
 import os
+import re
+from datetime import date
 from pathlib import Path
 from typing import Optional
 
 import aiosqlite
+
+from coach_ai.migrations import migrate_database
 
 
 # Global database connection
@@ -62,6 +66,9 @@ async def get_db() -> aiosqlite.Connection:
         )
         await _db.commit()
 
+        # Run migrations
+        await migrate_database(_db)
+
     return _db
 
 
@@ -70,16 +77,19 @@ async def get_db() -> aiosqlite.Connection:
 # ============================================================================
 
 
-async def add_todo(title: str, priority: str = "medium", notes: str = "") -> str:
-    """Add a new todo item.
+async def add_todo(
+    title: str, priority: str = "medium", notes: str = "", quick: bool = False
+) -> str:
+    """Add a new todo item with smart categorization.
 
     Args:
         title: The todo title/description
-        priority: Priority level - 'low', 'medium', or 'high'
+        priority: Priority level - 'low', 'medium', or 'high' (default: 'medium')
         notes: Optional additional notes or context
+        quick: Mark as quick win (automatically sets low priority and time estimate)
 
     Returns:
-        Success message
+        Success message with task ID
     """
     db = await get_db()
 
@@ -87,13 +97,68 @@ async def add_todo(title: str, priority: str = "medium", notes: str = "") -> str
     if priority not in ["low", "medium", "high"]:
         priority = "medium"
 
+    # Auto-categorization based on keywords
+    auto_notes = []
+    title_lower = title.lower()
+    notes_lower = notes.lower()
+
+    # Category detection
+    if any(keyword in title_lower for keyword in ["sprint", "sidecar", "migration"]):
+        auto_notes.append("[Sprint Work]")
+    if any(keyword in title_lower for keyword in ["korosh", "manager", "presentation", "meeting"]):
+        auto_notes.append("[Management]")
+    if any(keyword in title_lower or keyword in notes_lower for keyword in ["deadline", "due"]):
+        auto_notes.append("[Deadline]")
+
+    # Quick win handling
+    time_estimate = None
+    if quick or any(keyword in title_lower or keyword in notes_lower for keyword in ["quick", "easy"]):
+        priority = "low"  # Quick wins are low priority for selection
+        auto_notes.append("[Quick Win]")
+        time_estimate = 15  # Default 15 minutes for quick wins
+
+    # Extract time estimates from notes (e.g., "30min", "2h", "1hr")
+    time_pattern = r"(\d+)\s*(min|mins|minute|minutes|h|hr|hrs|hour|hours)"
+    time_match = re.search(time_pattern, notes_lower)
+    if time_match and not time_estimate:
+        amount = int(time_match.group(1))
+        unit = time_match.group(2)
+        if unit.startswith("h"):
+            time_estimate = amount * 60
+        else:
+            time_estimate = amount
+
+        # Mark as quick win if under 30 minutes
+        if time_estimate <= 30 and "[Quick Win]" not in auto_notes:
+            auto_notes.append("[Quick Win]")
+
+    # Combine notes
+    enhanced_notes = notes
+    if auto_notes:
+        prefix = " ".join(auto_notes)
+        enhanced_notes = f"{prefix}\n{notes}" if notes else prefix
+
+    # Insert todo
     await db.execute(
-        "INSERT INTO todos (title, priority, notes) VALUES (?, ?, ?)",
-        (title, priority, notes),
+        "INSERT INTO todos (title, priority, notes, time_estimate) VALUES (?, ?, ?, ?)",
+        (title, priority, enhanced_notes, time_estimate),
     )
     await db.commit()
 
-    return f"✓ Added todo: {title} (priority: {priority})"
+    # Get the ID of inserted todo
+    cursor = await db.execute("SELECT last_insert_rowid()")
+    row = await cursor.fetchone()
+    todo_id = row[0]
+
+    result = f"✓ Added todo #{todo_id}: {title}"
+    if quick or "[Quick Win]" in auto_notes:
+        result += " (quick win)"
+    result += f"\n  Priority: {priority}"
+    if time_estimate:
+        result += f" | Estimated time: {time_estimate}min"
+    result += "\n  It's in your backlog - run 'start_my_day' tomorrow to schedule it."
+
+    return result
 
 
 async def list_todos(status: str = "active") -> str:
